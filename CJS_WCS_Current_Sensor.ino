@@ -32,21 +32,13 @@ int adc0Normalised, adc0Offset;
 float adc0Adjusted;
 
 
-// The ADC module sends a interrupt signal to the Arduino when a conversion is completed.
-// This way, we will read the ADC only if it is ready.
-// We need to connect ALERT/RDY pin on the ADC1115 to pin ADCintPin on the Arduino.
-volatile int adcNewData = 0;
-void newDataReady() {
-  adcNewData = 1;
-}
 
-// WCS1700
+#define ZERO_CURRENT_WAIT_TIME 3000  //wait for 3 seconds to allow zero current measurement
+#define READ_DELAY 50                // 20 ms between rearings
+
+
 #define MODEL 2  //WCS1700
-
-#define ZERO_CURRENT_WAIT_TIME 300  //wait for 3 seconds to allow zero current measurement
-#define READ_DELAY 20               // 20 ms between rearings
-
-
+int sensor_model = MODEL;
 // ==============================================================================================================
 // WCS Sensitivity constants
 float sensitivity[6] = {
@@ -57,8 +49,6 @@ float sensitivity[6] = {
   70.0   //WCS2800
 };       // mV/A
 
-int sensor_model = MODEL;
-
 // 33mV/A and a bi-directional 70A sensor (140A range) is 0.033volt*140= 4.62volt span on a 5volt supply.
 // ADC1115 A/D (65535) on 2/3x gain +/- 6.144V, 1 bit = 0.1875mV
 // ADC1115 A/D (65535) on 1x gain +/- 4.096V  1 bit = 0.125mV
@@ -67,12 +57,11 @@ int sensor_model = MODEL;
 float current_resolution = 264;
 
 // GPIO where the DS18B20 is connected to
-#define ONE_WIRE_BUS 5
 // Setup a oneWire instance to communicate with any OneWire devices
 // Pass our oneWire reference to Dallas Temperature sensor
+#define ONE_WIRE_BUS 5
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
-
 
 // ==============================================================================================================
 // Current sensor variables
@@ -132,15 +121,12 @@ millisDelay adcDelay;
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("Hacky Monitor");
-
-  sensors.begin();  // Start up the library for temp measurement
-
+  Serial.println("** Hacky Monitor **");
 
   // Indicator LEDs
   pinMode(ledWarningPin, OUTPUT);
   pinMode(ledDangerPin, OUTPUT);
-  digitalWrite(ledWarningPin, HIGH);
+  digitalWrite(ledWarningPin, HIGH);  // Switch LEDs on to indicate startup of monitor
   digitalWrite(ledDangerPin, HIGH);
 
   //setup the display
@@ -161,24 +147,31 @@ void setup() {
   }
   ads.setGain(GAIN_ONE);  // 1x gain   +/- 4.096V  1 bit = 0.125mV
   // ads.setGain(GAIN_TWOTHIRDS);                                 // +/- 6.144V  1 bit = 0.1875mV (default)
-  ads.setDataRate(RATE_ADS1115_32SPS);                         //< 32 samples per second
-  ads.startADCReading(ADS1X15_REG_CONFIG_MUX_SINGLE_0, true);  // set adc reading to continuous mode
+  ads.setDataRate(RATE_ADS1115_32SPS);  //< 32 samples per second
+  //ads.startADCReading(ADS1X15_REG_CONFIG_MUX_SINGLE_0, true);  // set adc reading to continuous mode
 
   delay(ZERO_CURRENT_WAIT_TIME);
-  setZeroCurrent();
+  //***************************************
+  //setZeroCurrent();
 
+  /*
   if (debug == 1) {
     Serial.println((String) "adc0 offset: " + adc0Offset);
     Serial.println((String) "CURRENT ZERO: " + current_zero);
     Serial.println((String) "CURRENT INST: " + current_inst);
     Serial.println("ZERO==============================");
   }
+*/
 
+  /*
   // Initialize current average array using first reading. This means average normalizes quicker
   for (int thisReading = 0; thisReading < AvCurrentNumReadings; thisReading++) {
     AvCurrentTotal += current_inst;
     AvCurrentReadings[thisReading] = current_inst;
   }
+*/
+
+  sensors.begin();                // Start up the library for temp measurement
   sensors.requestTemperatures();  // Send the command to get temperatures
   temp_inst = sensors.getTempCByIndex(0);
   // Initialize temperature average array using first reading. This means average normalizes quicker
@@ -187,11 +180,9 @@ void setup() {
     AvTempReadings[thisReading] = temp_inst;
   }
 
-  digitalWrite(ledWarningPin, LOW);
-  digitalWrite(ledDangerPin, LOW);
-
+  pinMode(ADCintPin, INPUT);
   // The convention is ready on the falling edge of a pulse at the ALERT/RDY pin.
-  //attachInterrupt(ADCintPin, newDataReady, FALLING);
+  // attachInterrupt(ADCintPin, newDataReady, FALLING);
 
   // Setup decoder
   pinMode(encoderCLK, INPUT);
@@ -199,21 +190,21 @@ void setup() {
   lastStateCLK = digitalRead(encoderCLK);  // Read the initial state of CLK
   attachInterrupt(digitalPinToInterrupt(encoderCLK), updateEncoder, CHANGE);
 
-
-  pinMode(ADCintPin, INPUT);
-  // The convention is ready on the falling edge of a pulse at the ALERT/RDY pin.
-  attachInterrupt(digitalPinToInterrupt(ADCintPin), newDataReady, FALLING);
-
-  Serial.println("Setup pins");
-
-
-
   // Kick off the timers for reading sensors
   tempDelay.start(TEMPERATURE_READING_DELAY);
   displayDelay.start(DISPLAY_UPDATE_DELAY);
-  // adcDelay.start(ADC_UPDATE_DELAY);
+  adcDelay.start(ADC_UPDATE_DELAY);
+
+  // Determine the quiescent current for substration later
+  setZeroCurrent();
+  Serial.println((String) "CURRENT ZERO: " + current_zero);
+
+  // Turn LEDs off to indicate ready
+  digitalWrite(ledWarningPin, LOW);
+  digitalWrite(ledDangerPin, LOW);
 }
 
+//=========================================================================================
 
 void loop() {
   // loopTimer.check(Serial);
@@ -224,25 +215,15 @@ void loop() {
     temp_average = averageTemperature();
     temp_peak = (temp_inst > temp_peak) ? temp_inst : temp_peak;
     tempDelay.repeat();  // Start the timer again without drift
-    // Serial.println("TEMP DELAY");
   }
-  Serial.println(String("New data ")+adcNewData);
 
-  /*
   if (adcDelay.justFinished()) {
-    readExternalADC();
+    adc0 = ads.readADC_SingleEnded(0);
+    adc0Normalised = adc0 - adc0Offset;                  // remove quiescent current
+    current_inst = adc0Normalised / current_resolution;  // instantaneous current, adjusted for sensor range
     current_peak = (current_inst > current_peak) ? current_inst : current_peak;
     current_average = averageCurrent();
     adcDelay.repeat();
-    Serial.println("ADC DELAY");
-  }
-*/
-  if (adcNewData) {
-    readExternalADC();
-    current_peak = (current_inst > current_peak) ? current_inst : current_peak;
-    current_average = averageCurrent();
-    adcNewData = 0;
-    Serial.println("READ READ IN LOOP");
   }
 
   if (displayDelay.justFinished()) {
@@ -272,7 +253,7 @@ void loop() {
       displayline(temp_peak, 5, "");
       display.set1X();
     }
-    if (debug == 0) {
+    if (debug == 1) {
       Serial.println((String) "CURRENT INST: " + current_inst);
       Serial.println((String) "CURRENT AVG: " + current_average);
       Serial.println((String) "CURRENT RAW: " + adc0);
@@ -346,27 +327,20 @@ float averageTemperature() {
 
 
 void setZeroCurrent() {
-  int iteration = 50;
+  int iteration = 10;
   long current_accumulator = 0;
+  long currentAdc0zero = 0;
 
   for (int i = 0; i < iteration; i++) {
-    current_accumulator += ads.readADC_SingleEnded(0);
+    currentAdc0zero = ads.readADC_SingleEnded(0);
+    current_accumulator += currentAdc0zero;
+    //Serial.println((String) "CURRENT ZERO ACCUM: " + currentAdc0zero);
     delay(READ_DELAY);
   }
   adc0Offset = current_accumulator / iteration;  // Use this for calcs as quicker and less error than float
   current_zero = adc0Offset;                     // correction for center value.  keep as raw value for simpler calc
   current_inst = current_zero;
 }
-
-void readExternalADC() {
-  adc0 = ads.readADC_SingleEnded(0);
-  adc0Normalised = adc0 - adc0Offset;                  // remove quiescent current
-  current_inst = adc0Normalised / current_resolution;  // instantaneous current, adjusted for sensor
-  adcNewData = true;
-  Serial.println("READ READ");
-}
-
-
 
 /****************************************************************************/
 /*  I : Value measured to display                                           */
